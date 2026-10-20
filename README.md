@@ -27,8 +27,7 @@ Per 1080p frame, whole path (colour conversion, networks, back to 4:2:0):
 
 | Device | `.upscaleEnhance` (A (S)) | `.upscale` (C (S)) | `.enhance` |
 |---|---|---|---|
-| Apple TV 4K (3rd gen, A15) | **19–21 ms** (Neural Engine 13–16, GPU 4.5) | not measured yet | within budget (not timed) |
-| Apple M1 | 16 ms (Neural Engine ~12, GPU 2.8) | Neural Engine 5.7 ms (model alone) | 5.6 ms |
+| Apple TV 4K (3rd gen, A15) | **19–22 ms** (Neural Engine 13–16, GPU 4.5) | **13–17 ms** (Neural Engine 7–11, GPU 4.6) | **20–24 ms** (GPU 20–23) |
 
 The budget at 23.976 fps is 39.6 ms (95% of a frame).
 
