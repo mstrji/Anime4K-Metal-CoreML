@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+Package.resolved
+*.mlpackage/
+build/
+env/
+__pycache__/
+.DS_Store

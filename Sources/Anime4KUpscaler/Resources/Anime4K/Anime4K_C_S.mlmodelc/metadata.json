@@ -1,0 +1,67 @@
+[
+  {
+    "metadataOutputVersion" : "3.0",
+    "shortDescription" : "Anime4K C_S networks (Anime4K_Upscale_Denoise_CNN_x2_S) and de-ring statistics, from bloc97\/Anime4K (MIT).",
+    "outputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16)",
+        "shortDescription" : "",
+        "shape" : "[]",
+        "name" : "planes",
+        "type" : "MultiArray"
+      }
+    ],
+    "storagePrecision" : "Float16",
+    "modelParameters" : [
+
+    ],
+    "specificationVersion" : 8,
+    "mlProgramOperationTypeHistogram" : {
+      "Ios17.concat" : 4,
+      "Ios17.conv" : 5,
+      "Ios16.maxPool" : 1,
+      "Pad" : 4,
+      "Ios16.relu" : 3
+    },
+    "computePrecision" : "Mixed (Float16, Int32)",
+    "isUpdatable" : "0",
+    "stateSchema" : [
+
+    ],
+    "availability" : {
+      "macOS" : "14.0",
+      "tvOS" : "17.0",
+      "visionOS" : "1.0",
+      "watchOS" : "10.0",
+      "iOS" : "17.0",
+      "macCatalyst" : "17.0"
+    },
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "inputSchema" : [
+      {
+        "shortDescription" : "",
+        "dataType" : "Float16",
+        "hasShapeFlexibility" : "1",
+        "isOptional" : "0",
+        "shapeFlexibility" : "1 × 3 × 1080 × 1920 | 1 × 3 × 1088 × 1920 | 1 × 3 × 1080 × 1440 | 1 × 3 × 720 × 1280",
+        "formattedType" : "MultiArray (Float16 1 × 3 × 1080 × 1920)",
+        "type" : "MultiArray",
+        "shape" : "[1, 3, 1080, 1920]",
+        "name" : "rgb",
+        "enumeratedShapes" : "[[1, 3, 1080, 1920], [1, 3, 1088, 1920], [1, 3, 1080, 1440], [1, 3, 720, 1280]]"
+      }
+    ],
+    "userDefinedMetadata" : {
+      "com.github.apple.coremltools.version" : "9.0",
+      "com.github.apple.coremltools.source" : "milinternal",
+      "com.github.apple.coremltools.conversion_date" : "2026-10-20"
+    },
+    "generatedClassName" : "Anime4K_C_S",
+    "method" : "predict"
+  }
+]
