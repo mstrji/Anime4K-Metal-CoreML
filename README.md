@@ -21,18 +21,29 @@ Input: SDR 8- or 10-bit 4:2:0 frames (NV12 / P010, video or full range) up to 19
 Vision, 4:2:2/4:4:4 and anything larger pass through untouched. Output is always 8-bit 4:2:0 in the
 source's colour range and matrix.
 
-## Measured speed
+## Measured on an Apple TV 4K (3rd gen, A15)
 
-Per 1080p frame, whole path (colour conversion, networks, back to 4:2:0):
+Real playback of two episodes, one frame sampled per second, 24 frames per row. Times are per 1080p
+frame; **Total** is the whole path (colour conversion, networks, conversion back to 4:2:0) and is
+what has to fit the frame budget: 39.6 ms at 23.976 fps.
 
-| Device | `.upscaleEnhance` (A (S)) | `.upscale` (C (S)) | `.enhance` |
-|---|---|---|---|
-| Apple TV 4K (3rd gen, A15) | **19–22 ms** (Neural Engine 13–16, GPU 4.5) | **13–17 ms** (Neural Engine 7–11, GPU 4.6) | **20–24 ms** (GPU 20–23) |
+| Source | Mode | Runs on | Total p50 / p95 | GPU p50 / p95 | Neural Engine p50 | Over 16.7 ms (/24) | Ink-line gain vs 2× bilinear |
+|---|---|---|---|---|---|---|---|
+| Mission: Yozakura Family S02E01, 8-bit H.264 | `.enhance` | GPU | 19.5 / 23.3 ms | 18.8 / 22.7 ms | — | 22 | +30.0% |
+| | `.upscale` | Neural Engine | 14.8 / 16.8 ms | 4.6 / 4.7 ms | 9.3 ms | 3 | +9.5% |
+| | `.upscaleEnhance` | Neural Engine | 19.6 / 25.5 ms | 4.6 / 6.9 ms | 14.0 ms | 24 | +52.5% |
+| Re:ZERO S01E01, 10-bit HEVC | `.enhance` | GPU | 19.9 / 25.0 ms | 19.0 / 24.3 ms | — | 14 | −9.8% |
+| | `.upscale` | Neural Engine | 14.4 / 18.3 ms | 4.6 / 7.4 ms | 8.6 ms | 3 | +8.6% |
+| | `.upscaleEnhance` | Neural Engine | 20.9 / 24.5 ms | 4.7 / 4.9 ms | 14.6 ms | 24 | +64.4% |
 
-The budget at 23.976 fps is 39.6 ms (95% of a frame).
-
-\* On the GPU alone, A (S) took ~27 ms on the Apple TV, but after 15–20 s of that load the GPU
-throttled to 45–60 ms. Moving the networks to the Neural Engine is what made A (S) sustainable.
+- Every row fits 24 fps comfortably. "Over 16.7 ms" only matters for 60 fps sources, where `.upscale`
+  is the one mode that nearly keeps up.
+- **Ink-line gain** is the 99th percentile of the 4K luma gradient (central differences, 8-bit code
+  values) compared with a plain 2× bilinear upscale of the same frames. It counts grain as edges too,
+  so a mode that cleans a grainy source (`.enhance` on Re:ZERO) can score below bilinear while
+  looking cleaner. The gain is repeatable to the decimal on the same frames; timings vary by 1–3 ms.
+- On the GPU alone, A (S) took ~27 ms on this Apple TV until the GPU throttled after 15–20 s of that
+  load (45–60 ms). Moving the networks to the Neural Engine is what made `.upscaleEnhance` sustainable.
 
 ## Install
 
