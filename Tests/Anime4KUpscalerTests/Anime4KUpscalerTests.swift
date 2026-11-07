@@ -76,6 +76,10 @@ struct Anime4KUpscalerTests {
                 == ["Anime4K A (S)", "Anime4K Restore (S)"])
         #expect(Anime4KUpscaler.presets(for: .upscaleEnhance).map(\.neuralEngineModel) == ["Anime4K_A_S", nil])
         #expect(Anime4KUpscaler.presets(for: .upscale).map(\.neuralEngineModel) == ["Anime4K_C_S"])
+        #expect(Anime4KUpscaler.presets(for: .upscaleEnhanceHigh).map(\.name)
+                == ["Anime4K A (M)", "Anime4K A (S)", "Anime4K Restore (S)"])
+        #expect(Anime4KUpscaler.presets(for: .upscaleEnhanceHigh).map(\.neuralEngineModel)
+                == ["Anime4K_A_M", "Anime4K_A_S", nil])
     }
 
     /// Waits for the shaders and, when the mode wants it, the Neural Engine model.
@@ -90,7 +94,7 @@ struct Anime4KUpscalerTests {
 
     @Test("The Neural Engine draws the same picture as the GPU",
           arguments: [(Anime4KMode.upscaleEnhance, 1280, 720), (.upscaleEnhance, 1920, 1080),
-                      (.upscale, 1920, 1080)])
+                      (.upscale, 1920, 1080), (.upscaleEnhanceHigh, 1280, 720)])
     func neuralEngineMatchesGPU(mode: Anime4KMode, width: Int, height: Int) async throws {
         guard MTLCreateSystemDefaultDevice() != nil, NeuralEngineUpscaler.deviceHasNeuralEngine else { return }
         let size = (width, height)
@@ -300,6 +304,8 @@ struct Anime4KUpscalerTests {
     func capsFramesInFlight() async throws {
         guard MTLCreateSystemDefaultDevice() != nil else { return }
         let upscaler = Anime4KUpscaler()
+        // The same frame every time: reused, it would come back as one buffer and never fill the pool.
+        upscaler.reusesRepeatedFrames = false
         upscaler.setMode(.upscaleEnhance)
         let deadline = Date().addingTimeInterval(60)
         while upscaler.status.state == .preparing, Date() < deadline {
@@ -422,6 +428,71 @@ struct Anime4KUpscalerTests {
     }
 }
 
+/// `.upscaleEnhanceHigh`'s Neural Engine / GPU split, and repeated-frame reuse.
+@Suite("A (M) split and repeated frames")
+struct HighSplitAndRepeatTests {
+    @Test("A 1080p frame split between the Neural Engine and the GPU matches the whole frame")
+    func splitMatchesWholeFrame() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil, NeuralEngineUpscaler.deviceHasNeuralEngine else { return }
+        let upscaler = Anime4KUpscaler()
+        upscaler.setMode(.upscaleEnhanceHigh)
+        // The same frame each time: repeated-frame reuse would skip every upscale after the first.
+        upscaler.reusesRepeatedFrames = false
+        try await Anime4KUpscalerTests.ready(upscaler)
+        let source = try Anime4KUpscalerTests.busyFrame(width: 1920, height: 1080)
+        func run(_ split: Bool, _ n: Int) throws -> CVPixelBuffer {
+            upscaler.splitsHigh = split
+            var out: CVPixelBuffer?
+            for _ in 0..<n { out = upscaler.process(source) }
+            return try #require(out)
+        }
+        // The split first, on a fresh upscaler, and only its first frames (the row moves after 48): run
+        // after a whole frame, or after a move, the model's tensor already holds rows the split no
+        // longer prepares, which hid a tail drawing them as a black band.
+        let splitFrame = try run(true, 8)
+        #expect(upscaler.status.neuralEngineNote?.hasPrefix("split at row") == true)
+        let splitLuma = Anime4KUpscalerTests.bytes(splitFrame, plane: 0)
+        let splitChroma = Anime4KUpscalerTests.bytes(splitFrame, plane: 1)
+        let whole = try run(false, 2)
+        for (name, a, b) in [("luma", Anime4KUpscalerTests.bytes(whole, plane: 0), splitLuma),
+                             ("chroma", Anime4KUpscalerTests.bytes(whole, plane: 1), splitChroma)] {
+            var worst = 0, sum = 0
+            for i in a.indices {
+                let d = abs(Int(a[i]) - Int(b[i]))
+                sum += d
+                worst = max(worst, d)
+            }
+            let mean = Double(sum) / Double(a.count)
+            print(String(format: "[HighSplitAndRepeatTests] split vs whole %@: max %d codes, mean %.3f", name, worst, mean))
+            // The GPU's shaders and the model differ by rounding (~0.02-0.04 mean); a seam, a misplaced
+            // band or rows left undrawn would differ by far more.
+            #expect(worst <= 4, "\(name) max \(worst)")
+            #expect(mean < 0.1, "\(name) mean \(mean)")
+        }
+    }
+
+    @Test("A repeated frame comes back as the last upscaled buffer; a changed one is upscaled again")
+    func reusesRepeatedFrames() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil else { return }
+        let upscaler = Anime4KUpscaler()
+        upscaler.usesNeuralEngine = false
+        upscaler.setMode(.upscaleEnhance)
+        try await Anime4KUpscalerTests.ready(upscaler)
+        let first = try Anime4KUpscalerTests.busyFrame(width: 640, height: 360)
+        let again = try Anime4KUpscalerTests.busyFrame(width: 640, height: 360)
+        let changed = try Anime4KUpscalerTests.testFrame(pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                                         width: 640, height: 360)
+        let a = try #require(upscaler.process(first))
+        let b = try #require(upscaler.process(again))
+        #expect(a === b, "an identical frame should be reused")
+        let c = try #require(upscaler.process(changed))
+        #expect(c !== a, "a different frame should be upscaled afresh")
+        upscaler.reusesRepeatedFrames = false
+        let d = try #require(upscaler.process(changed))
+        #expect(d !== c, "with reuse off every frame is upscaled")
+    }
+}
+
 /// Opt-in GPU timing (`ANIME4K_UPSCALER_BENCH=1 swift test --filter Anime4KUpscalerBenchmark`): each
 /// preset in full and half precision, GPU time per 1080p → 4K frame, and how far half drifts from full.
 @Suite("Anime4KUpscalerBenchmark", .enabled(if: ProcessInfo.processInfo.environment["ANIME4K_UPSCALER_BENCH"] == "1"),
@@ -435,6 +506,7 @@ struct Anime4KUpscalerBenchmark {
             let upscaler = Anime4KUpscaler()
             upscaler.fusesTail = fused
             upscaler.usesNeuralEngine = false
+            upscaler.reusesRepeatedFrames = false
             upscaler.setMode(.upscaleEnhance)
             let deadline = Date().addingTimeInterval(60)
             while upscaler.status.state == .preparing, Date() < deadline {
@@ -452,15 +524,16 @@ struct Anime4KUpscalerBenchmark {
         }
     }
 
-    /// A (S) and A (M) per 1080p frame, the whole frame path, with their networks on the Neural Engine
-    /// and on the GPU.
-    @Test(arguments: [Anime4KMode.upscaleEnhance, .upscale])
+    /// A (S), C (S) and A (M) per 1080p frame, the whole frame path, with their networks on the Neural
+    /// Engine (A (M) split with the GPU) and on the GPU alone.
+    @Test(arguments: [Anime4KMode.upscaleEnhance, .upscale, .upscaleEnhanceHigh])
     func timesNeuralEngine(mode: Anime4KMode) async throws {
         guard MTLCreateSystemDefaultDevice() != nil, NeuralEngineUpscaler.deviceHasNeuralEngine else { return }
         let source = try Anime4KUpscalerTests.busyFrame(width: 1920, height: 1080)
         for neural in [true, false] {
             let upscaler = Anime4KUpscaler()
             upscaler.usesNeuralEngine = neural
+            upscaler.reusesRepeatedFrames = false
             upscaler.setMode(mode)
             try await Anime4KUpscalerTests.ready(upscaler)
             for _ in 0..<(Anime4KUpscaler.warmupFrames + 48) {

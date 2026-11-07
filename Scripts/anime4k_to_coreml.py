@@ -25,7 +25,7 @@ Usage (needs coremltools 9 and numpy, which have no wheels for Python 3.14; use 
     python3.11 -m venv env && env/bin/pip install coremltools numpy
     env/bin/python Scripts/anime4k_to_coreml.py --out <dir> [--check]
 then compile what it writes:
-    for m in A_S C_S; do xcrun coremlcompiler compile <dir>/Anime4K_$m.mlpackage \
+    for m in A_S A_M C_S; do xcrun coremlcompiler compile <dir>/Anime4K_$m.mlpackage \
         Sources/Anime4KUpscaler/Resources/Anime4K; done
 """
 
@@ -44,9 +44,20 @@ SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Sou
 # on the GPU. 1088 is H.264's coded height for 1080p; 1440x1080 is 4:3 at 1080p.
 SIZES = [(1920, 1080), (1920, 1088), (1440, 1080), (1280, 720)]
 
+# A (M) only: the top bands of a 1920x1080 frame split between the Neural Engine (top) and the GPU's
+# shaders (bottom). For a split after core row c the Neural Engine's band is c + SPLIT_HALO rows; the
+# halo covers both networks' reach (7 + 7 3x3 layers) and the 5x5 de-ring statistics. Must match
+# `Anime4KUpscaler.highSplitRows` / `highSplitHalo`.
+SPLIT_HALO = 24
+# Each size is another shape the Neural Engine compiles on first load (all eight took that load to
+# ~26 s on an Apple TV 4K, 3rd gen), so only the rows that box settles around (600) are built.
+SPLIT_ROWS = [540, 600, 660, 720]
+SPLIT_SIZES = {"A_M": [(1920, c + SPLIT_HALO) for c in SPLIT_ROWS]}
+
 # Model name -> (restore network or None, upscale network). C has no restore: its MAIN is the input.
 NETWORKS = {
     "A_S": ("Anime4K_Restore_CNN_S.glsl", "Anime4K_Upscale_CNN_x2_S.glsl"),
+    "A_M": ("Anime4K_Restore_CNN_M.glsl", "Anime4K_Upscale_CNN_x2_M.glsl"),
     "C_S": (None, "Anime4K_Upscale_Denoise_CNN_x2_S.glsl"),
 }
 
@@ -343,7 +354,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     for name in args.networks.split(","):
-        model, restore_layers, upscale_layers = build(name, SIZES)
+        model, restore_layers, upscale_layers = build(name, SIZES + SPLIT_SIZES.get(name, []))
         path = os.path.join(args.out, f"Anime4K_{name}.mlpackage")
         model.save(path)
         print("wrote", path)

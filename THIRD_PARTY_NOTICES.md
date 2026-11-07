@@ -3,7 +3,7 @@
 ## Anime4K
 
 The shaders in `Sources/Anime4KUpscaler/Resources/Anime4K/*.glsl`, and the Core ML models converted
-from their weights (`Anime4K_A_S.mlmodelc`, `Anime4K_C_S.mlmodelc`), come from
+from their weights (`Anime4K_A_S.mlmodelc`, `Anime4K_A_M.mlmodelc`, `Anime4K_C_S.mlmodelc`), come from
 [bloc97/Anime4K](https://github.com/bloc97/Anime4K) (commit `7684e958`).
 
 Copyright (c) 2019-2021 bloc97. MIT License — full text in

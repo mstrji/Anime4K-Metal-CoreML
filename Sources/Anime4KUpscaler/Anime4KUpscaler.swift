@@ -18,6 +18,11 @@ public enum Anime4KMode: String, Sendable, Equatable, CaseIterable {
     /// A (S): the restore network, then Anime4K's 2× upscale network (1080p → 4K). Neural Engine
     /// where possible, as `upscale`. Steps back to `enhance` when it cannot keep up, then off.
     case upscaleEnhance
+    /// A (M): the larger restore and 2× upscale networks (1080p → 4K), sharper and cleaner than A (S)
+    /// at about three times its work. On a 1920×1080 source the frame is split between the Neural
+    /// Engine (top rows) and the GPU (bottom rows), which run at the same time; other sizes run whole on
+    /// the Neural Engine. Steps back to `upscaleEnhance`, then `enhance`, then off.
+    case upscaleEnhanceHigh
 }
 
 /// What the upscaler is doing right now, for diagnostics. Read `Anime4KUpscaler.status`; it is a
@@ -95,6 +100,10 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         var neuralEngineModel: String?
     }
 
+    /// Mode A with Anime4K's (M) networks: the same chain as A (S), larger restore and upscale networks.
+    static let mediumPreset = Preset(name: "Anime4K A (M)", files: [
+        "Anime4K_Clamp_Highlights", "Anime4K_Restore_CNN_M", "Anime4K_Upscale_CNN_x2_M"],
+        neuralEngineModel: "Anime4K_A_M")
     /// Anime4K's "Mode A" chain for 1080p → 4K: de-ring statistics, CNN restore, CNN 2× upscale and
     /// the de-ring clamp.
     static let smallPreset = Preset(name: "Anime4K A (S)", files: [
@@ -117,11 +126,12 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         case .enhance: return [restoreOnlyPreset]
         case .upscale: return [lightPreset]
         case .upscaleEnhance: return [smallPreset, restoreOnlyPreset]
+        case .upscaleEnhanceHigh: return [mediumPreset, smallPreset, restoreOnlyPreset]
         }
     }
 
     /// Every preset bundled, for the benchmark.
-    static let allPresets: [Preset] = [smallPreset, lightPreset, restoreOnlyPreset]
+    static let allPresets: [Preset] = [mediumPreset, smallPreset, lightPreset, restoreOnlyPreset]
 
     /// Largest source it upscales: 2× of it is the 4K canvas (1088 covers coded-height H.264).
     public static let maximumSourceSize = (width: 1920, height: 1088)
@@ -145,7 +155,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
     static let startHeadroomBytes = 250 * 1_048_576
     static let runningFloorBytes = 150 * 1_048_576
 
-    private let stateLock = NSLock()
+    let stateLock = NSLock()
     private var mode: Anime4KMode = .off
     private var resources: Resources?
     private var preparing = false
@@ -179,13 +189,47 @@ public final class Anime4KUpscaler: @unchecked Sendable {
     var usesNeuralEngine = true
 
     /// Serialises GPU work and owns the texture pools.
-    private let workLock = NSLock()
-    private var intermediates = TexturePool()
+    let workLock = NSLock()
+    var intermediates = TexturePool()
     private var outputPool: (key: OutputKey, pool: CVPixelBufferPool)?
     /// The Neural Engine's input and output tensors for the current source size.
-    private var neuralBuffers: (key: NeuralEngineUpscaler.Size, input: CVPixelBuffer, output: CVPixelBuffer)?
+    var neuralBuffers: (key: NeuralEngineUpscaler.Size, input: CVPixelBuffer, output: CVPixelBuffer)?
+    /// A (M)'s Neural Engine / GPU split (`HighSplit.swift`): the GPU half's texture pool and band
+    /// texture (guarded by `workLock`), and where the split sits and what its last frames took
+    /// (guarded by `stateLock`).
+    var splitPool = TexturePool()
+    var splitTextures: (band: MTLTexture, bandRows: Int)?
+    /// Starts at row 600, where an Apple TV 4K (3rd gen) began; it settled at 720 there.
+    var highSplitIndex = 1
+    var highSplitNote: String?
+    var lastHighSplitLog = Date.distantPast
+    var highSplitWindow: [(Double, Double, Double)] = []
+    var highSplitArrivedAt = Date.distantPast
+    var splitsHighStorage = true
+    /// Repeated-frame reuse (`RepeatFrames.swift`), guarded by `workLock`.
+    var repeatState: RepeatState?
+    var repeatFrames = 0
+    var repeatReused = 0
+    var lastRepeatLog = Date.distantPast
+    private var reusesRepeatedFramesStorage = true
 
     public init() {}
+
+    /// Whether `.upscaleEnhanceHigh` splits a 1920×1080 frame between the Neural Engine and the GPU
+    /// (on by default). Off, A (M) runs whole on the Neural Engine: ~45–50 ms a frame on an Apple TV 4K
+    /// (3rd gen), over a 24 fps budget, so it steps down to A (S) there.
+    public var splitsHigh: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return splitsHighStorage }
+        set { stateLock.lock(); splitsHighStorage = newValue; stateLock.unlock() }
+    }
+
+    /// Whether a frame that repeats the drawing last upscaled is returned as that same upscaled buffer
+    /// instead of being upscaled again (on by default). Anime is mostly drawn on twos and threes, so
+    /// this skips about half the work, and the heat, with the picture unchanged.
+    public var reusesRepeatedFrames: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return reusesRepeatedFramesStorage }
+        set { stateLock.lock(); reusesRepeatedFramesStorage = newValue; stateLock.unlock() }
+    }
 
     // MARK: - Control
 
@@ -218,6 +262,12 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         stateLock.unlock()
 
         if newMode == .off { releaseIntermediates() }
+        // A frame upscaled in another mode must not be returned again as a repeat in this one.
+        if changed {
+            workLock.lock()
+            repeatState = nil
+            workLock.unlock()
+        }
         if needsPreparation {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.prepare() }
         }
@@ -245,6 +295,9 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         intermediates = TexturePool()
         outputPool = nil
         neuralBuffers = nil
+        repeatState = nil
+        splitPool = TexturePool()
+        splitTextures = nil
         workLock.unlock()
         stateLock.lock()
         heldBytes = nil
@@ -260,7 +313,10 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         guard mode != .off, presetIndex < modePresets.count else { return status }
         status.preset = modePresets[presetIndex].name
         status.backend = lastBackend
-        if let model = modePresets[presetIndex].neuralEngineModel { status.neuralEngineNote = neuralEngineNotes[model] }
+        if let model = modePresets[presetIndex].neuralEngineModel {
+            status.neuralEngineNote = neuralEngineNotes[model]
+                ?? (modePresets[presetIndex] == Self.mediumPreset ? highSplitNote : nil)
+        }
         status.budgetMilliseconds = budget
         status.averageFrameMilliseconds = timing.medianWall
         status.averageGPUMilliseconds = timing.medianGPU
@@ -285,7 +341,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
 
     // MARK: - Preparation
 
-    private final class Resources {
+    final class Resources {
         let device: MTLDevice
         let queue: MTLCommandQueue
         let textureCache: CVMetalTextureCache
@@ -297,6 +353,13 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         /// reading the model's planes. Optional: without them A (S) stays on the GPU.
         let yuvToPlanar: MTLComputePipelineState?
         let planarTail: MTLComputePipelineState?
+        /// A (M)'s split: the GPU band's conversion, its textures into the model's planes, and the
+        /// fused tail on the band's own rows. Optional: without them A (M) runs whole.
+        let yuvToRGBRows: MTLComputePipelineState?
+        let texturesToPlanes: MTLComputePipelineState?
+        let fusedTailRows: MTLComputePipelineState?
+        /// The repeated-frame comparison. Optional: without it every frame is upscaled.
+        let repeatCompare: MTLComputePipelineState?
         /// Compiled chains by preset name: every preset any mode can run.
         let presets: [String: MPVHookPipeline]
         let sampler: MTLSamplerState
@@ -305,6 +368,8 @@ public final class Anime4KUpscaler: @unchecked Sendable {
              yuvToRGB: MTLComputePipelineState, rgbToLuma: MTLComputePipelineState,
              rgbToChroma: MTLComputePipelineState, fusedTail: MTLComputePipelineState?,
              yuvToPlanar: MTLComputePipelineState?, planarTail: MTLComputePipelineState?,
+             yuvToRGBRows: MTLComputePipelineState?, texturesToPlanes: MTLComputePipelineState?,
+             fusedTailRows: MTLComputePipelineState?, repeatCompare: MTLComputePipelineState?,
              presets: [String: MPVHookPipeline], sampler: MTLSamplerState) {
             self.device = device
             self.queue = queue
@@ -315,6 +380,10 @@ public final class Anime4KUpscaler: @unchecked Sendable {
             self.fusedTail = fusedTail
             self.yuvToPlanar = yuvToPlanar
             self.planarTail = planarTail
+            self.yuvToRGBRows = yuvToRGBRows
+            self.texturesToPlanes = texturesToPlanes
+            self.fusedTailRows = fusedTailRows
+            self.repeatCompare = repeatCompare
             self.presets = presets
             self.sampler = sampler
         }
@@ -439,6 +508,10 @@ public final class Anime4KUpscaler: @unchecked Sendable {
             fusedTail: try? pipeline("upscaler_fused_tail"),
             yuvToPlanar: try? pipeline("upscaler_yuv_to_planar"),
             planarTail: try? pipeline("upscaler_planar_tail"),
+            yuvToRGBRows: try? pipeline("upscaler_yuv_to_rgb_rows"),
+            texturesToPlanes: try? pipeline("upscaler_textures_to_planes"),
+            fusedTailRows: try? pipeline("upscaler_fused_tail_rows"),
+            repeatCompare: try? pipeline("upscaler_repeat_compare"),
             presets: Dictionary(uniqueKeysWithValues: zip(runnable.map(\.name), pipelines)), sampler: sampler)
     }
 
@@ -559,7 +632,9 @@ public final class Anime4KUpscaler: @unchecked Sendable {
             stateLock.unlock()
             return nil
         }
-        let scale = modePresets[presetIndex].scale
+        let preset = modePresets[presetIndex]
+        let scale = preset.scale
+        let reusesRepeats = reusesRepeatedFramesStorage
         let neuralEngineModel = usesNeuralEngine ? modePresets[presetIndex].neuralEngineModel : nil
         let neuralEngine = neuralEngineModel.flatMap { neuralEngines[$0] }
         stateLock.unlock()
@@ -588,9 +663,22 @@ public final class Anime4KUpscaler: @unchecked Sendable {
             && resources.yuvToPlanar != nil && resources.planarTail != nil
 
         workLock.lock()
+        // A frame repeating the drawing last upscaled is returned as that upscaled frame (`RepeatFrames.swift`).
+        if reusesRepeats, let reused = repeatedOutput(for: source, format: format, resources: resources) {
+            workLock.unlock()
+            return reused
+        }
         let result: FrameResult?
         do {
-            if let neuralEngine, onNeuralEngine {
+            if let neuralEngine, onNeuralEngine,
+               let row = highSplitRow(preset: preset, width: width, height: height, model: neuralEngine,
+                                      pipeline: pipeline, resources: resources) {
+                // A (M) split between the Neural Engine and the GPU's own shaders (`HighSplit.swift`).
+                result = try encodeHighSplit(source: source, width: width, height: height, format: format,
+                                             inputParams: &inputParams, outputParams: &outputParams,
+                                             resources: resources, model: neuralEngine,
+                                             pipeline: pipeline, row: row)
+            } else if let neuralEngine, onNeuralEngine {
                 result = try encodeNeuralEngine(source: source, width: width, height: height, format: format,
                                                 inputParams: &inputParams, outputParams: &outputParams,
                                                 resources: resources, model: neuralEngine)
@@ -625,6 +713,11 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         let output = result.buffer
 
         Self.copyAttachments(from: source, to: output, scale: scale)
+        if reusesRepeats {
+            workLock.lock()
+            rememberUpscaled(source: source, output: output, format: format, resources: resources)
+            workLock.unlock()
+        }
         noteFrame(milliseconds: result.workMilliseconds, gpuMilliseconds: result.gpuMilliseconds,
                   neuralEngineMilliseconds: result.neuralEngineMilliseconds,
                   input: CGSize(width: width, height: height),
@@ -632,7 +725,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         return output
     }
 
-    private struct FrameResult {
+    struct FrameResult {
         let buffer: CVPixelBuffer
         /// Everything after a free output frame was found: GPU, Neural Engine and the waits between.
         let workMilliseconds: Double
@@ -641,7 +734,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         var neuralEngineMilliseconds: Double?
     }
 
-    private struct NeuralEnginePredictionFailed: Error {
+    struct NeuralEnginePredictionFailed: Error {
         let underlying: Error
     }
 
@@ -827,7 +920,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
                            gpuMilliseconds: gpu)
     }
 
-    private static func dispatch(
+    static func dispatch(
         _ commandBuffer: MTLCommandBuffer, _ pipeline: MTLComputePipelineState, textures: [MTLTexture],
         params: inout ConversionParams, grid: (Int, Int)
     ) throws {
@@ -841,12 +934,12 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         encoder.endEncoding()
     }
 
-    private struct PlaneTexture {
+    struct PlaneTexture {
         let cvTexture: CVMetalTexture
         let texture: MTLTexture
     }
 
-    private static func planeTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat,
+    static func planeTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat,
                                      cache: CVMetalTextureCache) -> PlaneTexture? {
         var cvTexture: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(
@@ -859,7 +952,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
     }
 
     /// A single-plane buffer as one texture (the Neural Engine's tensors).
-    private static func wholeTexture(_ buffer: CVPixelBuffer, format: MTLPixelFormat,
+    static func wholeTexture(_ buffer: CVPixelBuffer, format: MTLPixelFormat,
                                      cache: CVMetalTextureCache) -> PlaneTexture? {
         var cvTexture: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(
@@ -870,13 +963,13 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         return PlaneTexture(cvTexture: cvTexture, texture: texture)
     }
 
-    private struct OutputKey: Equatable {
+    struct OutputKey: Equatable {
         let pixelFormat: OSType
         let width: Int
         let height: Int
     }
 
-    private func makeOutputBuffer(pixelFormat: OSType, width: Int, height: Int) -> CVPixelBuffer? {
+    func makeOutputBuffer(pixelFormat: OSType, width: Int, height: Int) -> CVPixelBuffer? {
         let key = OutputKey(pixelFormat: pixelFormat, width: width, height: height)
         if outputPool?.key != key {
             let attributes: [String: Any] = [
@@ -1182,6 +1275,116 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         float d = ditherOffset(gid, p.dither);
         chromaTex.write(float4(saturate(cb * p.cScale + p.cOffset + d),
                                saturate(cr * p.cScale + p.cOffset + d), 0.0, 0.0), gid);
+    }
+
+    // upscaler_yuv_to_rgb for rows `rowOffset ...` of the frame only, into a band-sized texture: the GPU
+    // half of A (M)'s split.
+    kernel void upscaler_yuv_to_rgb_rows(texture2d<float, access::read> lumaTex [[texture(0)]],
+                                         texture2d<float, access::sample> chromaTex [[texture(1)]],
+                                         texture2d<float, access::write> rgbTex [[texture(2)]],
+                                         constant ConversionParams& p [[buffer(0)]],
+                                         constant uint& rowOffset [[buffer(1)]],
+                                         uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= rgbTex.get_width() || gid.y >= rgbTex.get_height()) { return; }
+        constexpr sampler chromaSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+        uint2 g = uint2(gid.x, gid.y + rowOffset);
+        float2 pos = (float2(g) + 0.5) / float2(lumaTex.get_width(), lumaTex.get_height());
+        float y = (lumaTex.read(g).r - p.yOffset) / p.yScale;
+        float2 c = (chromaTex.sample(chromaSampler, pos).rg - p.cOffset) / p.cScale;
+        float kg = 1.0 - p.kr - p.kb;
+        float r = y + 2.0 * (1.0 - p.kr) * c.y;
+        float b = y + 2.0 * (1.0 - p.kb) * c.x;
+        float gg = (y - p.kr * r - p.kb * b) / kg;
+        rgbTex.write(float4(saturate(float3(r, gg, b)), 1.0), gid);
+    }
+
+    // One thread per 8x8 block; flags the frame changed when the block's mean difference from the
+    // reference (summed over its components: luma, or Cb and Cr) passes the threshold.
+    kernel void upscaler_repeat_compare(texture2d<float, access::read> current [[texture(0)]],
+                                        texture2d<float, access::read> reference [[texture(1)]],
+                                        device atomic_uint* changed [[buffer(0)]],
+                                        constant float& threshold [[buffer(1)]],
+                                        uint2 gid [[thread_position_in_grid]]) {
+        uint w = current.get_width(), h = current.get_height();
+        uint2 o = gid * 8;
+        if (o.x >= w || o.y >= h) { return; }
+        float sum = 0.0;
+        float n = 0.0;
+        for (uint y = o.y; y < min(o.y + 8, h); y++) {
+            for (uint x = o.x; x < min(o.x + 8, w); x++) {
+                float2 d = abs(current.read(uint2(x, y)).rg - reference.read(uint2(x, y)).rg);
+                sum += d.x + d.y;
+                n += 1.0;
+            }
+        }
+        if (sum / n > threshold) { atomic_store_explicit(changed, 1u, memory_order_relaxed); }
+    }
+
+    // upscaler_fused_tail on rows `srcRow ..< srcRow + rows` of A (M)'s split GPU band, written as source
+    // rows `dstRow ...` of the frame, inside the GPU's half while the Neural Engine still runs.
+    struct TailRowsParams { uint srcRow; uint dstRow; uint rows; uint padding; };
+    kernel void upscaler_fused_tail_rows(texture2d<float, access::sample> restoredTex [[texture(0)]],
+                                         texture2d<float, access::read> residualTex [[texture(1)]],
+                                         texture2d<float, access::sample> statsTex [[texture(2)]],
+                                         texture2d<float, access::write> lumaTex [[texture(3)]],
+                                         texture2d<float, access::write> chromaTex [[texture(4)]],
+                                         constant ConversionParams& p [[buffer(0)]],
+                                         constant TailRowsParams& r [[buffer(1)]],
+                                         uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= residualTex.get_width() || gid.y >= r.rows) { return; }
+        constexpr sampler linearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+        float2 bandSize = float2(residualTex.get_width(), residualTex.get_height());
+        uint2 t = uint2(gid.x, r.srcRow + gid.y);
+        uint2 g = uint2(gid.x, r.dstRow + gid.y);
+        float4 residual = residualTex.read(t);
+        float3 kY = float3(p.kr, 1.0 - p.kr - p.kb, p.kb);
+        float3 sum = float3(0.0);
+        for (uint dy = 0; dy < 2; dy++) {
+            for (uint dx = 0; dx < 2; dx++) {
+                uint2 o = g * 2 + uint2(dx, dy);
+                float2 pos = (float2(t) + float2(dx, dy) * 0.5 + 0.25) / bandSize;
+                float3 rgb = restoredTex.sample(linearSampler, pos).rgb + residual[dy * 2 + dx];
+                float luma = dot(float3(0.299, 0.587, 0.114), rgb);
+                float clamped = min(luma, statsTex.sample(linearSampler, pos).x);
+                rgb = saturate(rgb - (luma - clamped));
+                float y = dot(rgb, kY);
+                lumaTex.write(float4(saturate(y * p.yScale + p.yOffset + ditherOffset(o, p.dither))), o);
+                sum += rgb;
+            }
+        }
+        float3 rgb = sum * 0.25;
+        float y = dot(rgb, kY);
+        float cb = (rgb.b - y) / (2.0 * (1.0 - p.kb));
+        float cr = (rgb.r - y) / (2.0 * (1.0 - p.kr));
+        float d = ditherOffset(g, p.dither);
+        chromaTex.write(float4(saturate(cb * p.cScale + p.cOffset + d),
+                               saturate(cr * p.cScale + p.cOffset + d), 0.0, 0.0), g);
+    }
+
+
+    // A (M)'s split, the GPU half: rows `srcRow ...` of the shaders' restored picture, residuals and
+    // de-ring statistics (all at the band's source size) written as rows `dstRow ...` of the Neural
+    // Engine's eight planes (`planeRows` tall): the same quantities the model writes.
+    struct PlanesParams { uint planeRows; uint srcRow; uint dstRow; uint rows; };
+    kernel void upscaler_textures_to_planes(texture2d<float, access::read> restoredTex [[texture(0)]],
+                                            texture2d<float, access::read> residualTex [[texture(1)]],
+                                            texture2d<float, access::read> statsTex [[texture(2)]],
+                                            texture2d<float, access::write> planesTex [[texture(3)]],
+                                            constant PlanesParams& p [[buffer(0)]],
+                                            uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= residualTex.get_width() || gid.y >= p.rows) { return; }
+        uint2 s = uint2(gid.x, p.srcRow + gid.y);
+        uint y = p.dstRow + gid.y, h = p.planeRows;
+        float3 rgb = restoredTex.read(s).rgb;
+        float4 r = residualTex.read(s);
+        planesTex.write(float4(rgb.r), uint2(gid.x, y));
+        planesTex.write(float4(rgb.g), uint2(gid.x, y + h));
+        planesTex.write(float4(rgb.b), uint2(gid.x, y + 2 * h));
+        planesTex.write(float4(r.x), uint2(gid.x, y + 3 * h));
+        planesTex.write(float4(r.y), uint2(gid.x, y + 4 * h));
+        planesTex.write(float4(r.z), uint2(gid.x, y + 5 * h));
+        planesTex.write(float4(r.w), uint2(gid.x, y + 6 * h));
+        planesTex.write(float4(statsTex.read(s).x), uint2(gid.x, y + 7 * h));
     }
     """
 }
