@@ -199,8 +199,9 @@ public final class Anime4KUpscaler: @unchecked Sendable {
     /// (guarded by `stateLock`).
     var splitPool = TexturePool()
     var splitTextures: (band: MTLTexture, bandRows: Int)?
-    /// Starts at row 600, where an Apple TV 4K (3rd gen) began; it settled at 720 there.
-    var highSplitIndex = 1
+    /// Starts at row 720, where an Apple TV 4K (3rd gen) settles every time: started at 600, its GPU
+    /// half took 36-43 ms for the ~5 s until the first move.
+    var highSplitIndex = 3
     var highSplitNote: String?
     var lastHighSplitLog = Date.distantPast
     var highSplitWindow: [(Double, Double, Double)] = []
