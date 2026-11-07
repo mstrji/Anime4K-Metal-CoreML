@@ -52,8 +52,10 @@ what has to fit the frame budget: 39.6 ms at 23.976 fps.
 A (M) is about three times A (S)'s work. Whole on the Neural Engine it takes ~45–50 ms per 1080p
 frame, over the 39.6 ms budget, so on a 1920×1080 source the frame is **split**: the Neural Engine
 runs the model on the top rows while the GPU runs the same networks as Metal shaders on the bottom
-rows, at the same time, and the two halves are joined. Every 2 s the split moves to the row where
-both sides' measured cost per row says they would finish together. With **repeated-frame reuse** (on
+rows, at the same time, and the two halves are joined. The split stays at row 720 (720 rows on the
+Neural Engine, 360 on the GPU), where this Apple TV settled every time; on hardware with a relatively
+stronger GPU set `rebalancesHighSplit = true` and every 2 s it moves to the row where both halves
+would finish together (a Mac settles at 540). With **repeated-frame reuse** (on
 by default, below) only about half the frames are upscaled at all.
 
 Measured in a player built on this code (5 minutes of A Tale of the Secret Saint, 1080p H.264, 23.976
@@ -61,7 +63,7 @@ fps, logged every 2 s):
 
 | | |
 |---|---|
-| Split row | settles at 720 of 1080 (Neural Engine 720 rows, GPU 360) |
+| Split row | 720 of 1080 (Neural Engine 720 rows, GPU 360) |
 | Neural Engine / GPU half | ~25–31 / ~24–35 ms |
 | Frame | ~27–38 ms typical, occasional spikes to 40–45 ms |
 | Frames reused as repeats | 50–64% |
@@ -109,9 +111,10 @@ func didDecode(_ frame: CVPixelBuffer, pts: CMTime) {
     }
 }
 
-// Optional, both on by default:
+// Optional settings, shown at their defaults:
 upscaler.reusesRepeatedFrames = true      // return a repeated drawing's last upscaled frame
 upscaler.splitsHigh = true                // .upscaleEnhanceHigh: split 1080p across Neural Engine and GPU
+upscaler.rebalancesHighSplit = false      // off by default: keep the split at row 720
 
 // Diagnostics, e.g. in a stats overlay:
 let s = upscaler.status   // state, preset, backend ("Neural Engine"/"GPU"), median times, budget, memory

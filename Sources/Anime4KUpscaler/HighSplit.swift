@@ -16,8 +16,9 @@ import Metal
 /// After both finish, `upscaler_textures_to_planes` writes the GPU's rows just below the split into the
 /// tensor (the model writes its halo rows there too, computed with less context, and they must be
 /// overwritten), and the planar tail runs on the rows above.
-/// The halo (24 rows) covers both networks' 14-pixel reach and the 5x5 de-ring statistics. Every 2 s the
-/// split moves to the row where both sides' measured cost per row says they would take the same time.
+/// The halo (24 rows) covers both networks' 14-pixel reach and the 5x5 de-ring statistics. The split
+/// stays at row 720 unless `rebalancesHighSplit` is on; then every 2 s it moves to the row where both
+/// sides' measured cost per row says they would take the same time.
 /// Bands must be sizes the model was built for (`Scripts/anime4k_to_coreml.py`, SPLIT_ROWS).
 extension Anime4KUpscaler {
     /// The rows an Apple TV 4K (3rd gen) moves between (600 to 720); each is a shape the model compiles
@@ -213,9 +214,9 @@ extension Anime4KUpscaler {
         // were tried on an Apple TV 4K (3rd gen) and each either hopped between rows (gaps of 8-10% are
         // the halves' ordinary noise) or stayed put on a worse row because the gap never crossed 15%.
         let total = (CFAbsoluteTimeGetCurrent() - workStarted) * 1000
-        highSplitWindow.append((prediction, gpuBandMilliseconds, total))
+        if rebalancesHighSplitStorage { highSplitWindow.append((prediction, gpuBandMilliseconds, total)) }
         var moved: String?
-        if highSplitWindow.count >= 48 {
+        if rebalancesHighSplitStorage, highSplitWindow.count >= 48 {
             func median(_ v: [Double]) -> Double { v.sorted()[v.count / 2] }
             let ne = median(highSplitWindow.map(\.0)), gpu = median(highSplitWindow.map(\.1))
             highSplitWindow.removeAll()

@@ -207,6 +207,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
     var highSplitWindow: [(Double, Double, Double)] = []
     var highSplitArrivedAt = Date.distantPast
     var splitsHighStorage = true
+    var rebalancesHighSplitStorage = false
     /// Repeated-frame reuse (`RepeatFrames.swift`), guarded by `workLock`.
     var repeatState: RepeatState?
     var repeatFrames = 0
@@ -222,6 +223,16 @@ public final class Anime4KUpscaler: @unchecked Sendable {
     public var splitsHigh: Bool {
         get { stateLock.lock(); defer { stateLock.unlock() }; return splitsHighStorage }
         set { stateLock.lock(); splitsHighStorage = newValue; stateLock.unlock() }
+    }
+
+    /// Whether `.upscaleEnhanceHigh`'s split moves from row 720 (off by default). On an Apple TV 4K
+    /// (3rd gen) it settled at 720 in every run, and during Neural Engine slow spells (heat, a full-file
+    /// download alongside) it moved to 660 and frames read 44-47 ms there while 720 held steadier; each
+    /// move also costs a slow frame. Turn it on for hardware whose GPU is relatively stronger (a Mac
+    /// settles at 540): every 2 s the split moves to the row where both halves would finish together.
+    public var rebalancesHighSplit: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return rebalancesHighSplitStorage }
+        set { stateLock.lock(); rebalancesHighSplitStorage = newValue; stateLock.unlock() }
     }
 
     /// Whether a frame that repeats the drawing last upscaled is returned as that same upscaled buffer
