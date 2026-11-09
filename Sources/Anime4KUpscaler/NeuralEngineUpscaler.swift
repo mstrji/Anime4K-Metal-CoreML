@@ -56,9 +56,13 @@ final class NeuralEngineUpscaler {
         }
     }
 
+    /// The bundled model this runs, e.g. "Anime4K_A_M".
+    let modelName: String
+
     /// Loads the model for the Neural Engine. The first load on a device compiles it for that
     /// device's Neural Engine, a few seconds; the system caches that compilation.
     init(modelName: String) throws {
+        self.modelName = modelName
         guard Self.deviceHasNeuralEngine else { throw LoadError.noNeuralEngine }
         guard let url = Self.modelURL(modelName) else { throw LoadError.missingModel }
         let configuration = MLModelConfiguration()

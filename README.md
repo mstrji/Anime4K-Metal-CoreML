@@ -12,10 +12,13 @@ anime to 4K for a whole episode without its GPU overheating.
 | `.enhance` | Anime4K **Restore (S)**: crisper lines, less blur and compression damage | same size | GPU (Metal) |
 | `.upscale` | Anime4K **C (S)**: 2× upscale with light denoising | 2× (1080p → 4K) | Neural Engine |
 | `.upscaleEnhance` | Anime4K **A (S)**: Restore, then 2× upscale | 2× (1080p → 4K) | Neural Engine |
+| `.upscaleEnhanceBalanced` | **Balanced**: A (M)'s larger Restore with A (S)'s 2× upscale | 2× (1080p → 4K) | Neural Engine, never split |
+| `.upscaleEnhanceBalanced720` / `780` / `840` | **Balanced**, split at that row | 2× (1080p → 4K) | Neural Engine + GPU, split |
 | `.upscaleEnhanceHigh` | Anime4K **A (M)**: the larger Restore and 2× upscale networks | 2× (1080p → 4K) | Neural Engine + GPU, split |
 
 Each mode watches its own speed. If the device cannot keep up with the video's frame rate,
-`.upscaleEnhanceHigh` steps back to `.upscaleEnhance`, `.upscaleEnhance` steps back to `.enhance`, and
+`.upscaleEnhanceHigh` and the Balanced modes step back to `.upscaleEnhance`, `.upscaleEnhance` steps
+back to `.enhance`, and
 the others switch themselves off. Playback never
 stops: a frame that is not processed is shown as it was decoded.
 
@@ -78,6 +81,38 @@ fps, logged every 2 s):
   box), so call `setMode(.upscaleEnhanceHigh)` early, e.g. at launch, to get it ready in advance.
 - Split against whole on the same frame: luma at most 2 steps apart (mean 0.02), chroma 1 (mean 0.01).
 
+### Balanced on the same Apple TV
+
+Restore is the half of A that shows most (crisper lines, less blur and compression damage); the 2×
+upscale adds less over a TV's own scaling. Balanced pairs A (M)'s larger Restore (7 layers) with A (S)'s
+small upscale (4 layers), so the extra work goes where it shows. One model, `Anime4K_A_MS`, serves all
+four modes. The split modes put the top 720, 780 or 840 rows of a 1920×1080 frame on the Neural Engine
+and the rest on the GPU, at that fixed row (never rebalanced); set `splitsBalanced = false` to run them
+whole.
+
+Measured in a player built on this code, on a busy scene (0–4% of frames repeated), logged every 2 s.
+**Neural Engine** and **GPU band** are the two halves running side by side; **Frame** is the whole path.
+
+| Mode | Watched | Neural Engine | GPU band | Frame p50 (range) | Dropped |
+|---|---|---|---|---|---|
+| `.upscaleEnhanceBalanced` | ~10 s | 30–35 ms (whole frame) | — | ~36 ms, frequent frames over 39.6 | 0 |
+| `.upscaleEnhanceBalanced720` | ~2.5 min | ~22 ms | ~23 ms | ~28 ms (23–31) | 1 display-layer drop |
+| `.upscaleEnhanceBalanced780` | ~50 s | 24 ms | 22 ms | 30 ms (27–36) | 0 |
+| `.upscaleEnhanceBalanced840` | ~80 s | 24 ms | 19 ms | 31 ms (25–34) | 0 |
+
+- **720** is the fastest per frame; the two halves are about even there.
+- **840** leaves the GPU the least work, so it runs coolest, and the Neural Engine took no longer for
+  840 rows than for 780 here. It is the one to start with on an Apple TV 4K (3rd gen).
+- **Unsplit Balanced** fits a 24 fps budget, but with little room: expect it to step back to A (S) on
+  busy scenes.
+- `status.averageGPUMilliseconds` counts all of a frame's GPU work, so it reads ~6 ms above the split's
+  GPU band: the colour conversion before the networks and the fused tail after them stay on the GPU
+  whatever the row. The split's own line (`status.neuralEngineNote`, "split at row …") gives each half.
+- In that player Balanced never stepped back: a frame that would be late was shown resized instead,
+  which keeps picture and audio in step. This package cannot do that for you (`process` is
+  synchronous), so here Balanced steps back like the other modes.
+- Same picture split or whole: luma at most 2 steps apart (mean ~0.01), chroma 1.
+
 ## Install
 
 Swift Package Manager:
@@ -114,6 +149,7 @@ func didDecode(_ frame: CVPixelBuffer, pts: CMTime) {
 // Optional settings, shown at their defaults:
 upscaler.reusesRepeatedFrames = true      // return a repeated drawing's last upscaled frame
 upscaler.splitsHigh = true                // .upscaleEnhanceHigh: split 1080p across Neural Engine and GPU
+upscaler.splitsBalanced = true            // .upscaleEnhanceBalanced720/780/840: split at their row
 upscaler.rebalancesHighSplit = false      // off by default: keep the split at row 720
 
 // Diagnostics, e.g. in a stats overlay:
@@ -139,7 +175,7 @@ let s = upscaler.status   // state, preset, backend ("Neural Engine"/"GPU"), med
 - **Size.** A returned buffer carries the attachment `Anime4KUpscaler.upscaleFactorAttachmentKey`
   (1 or 2), so your player can keep reporting the source's own resolution.
 - **Model sizes.** The Neural Engine models are built for 1920×1080, 1920×1088, 1440×1080 and
-  1280×720 (A (M) also for its split bands). Other sizes run the same networks on the GPU.
+  1280×720 (A (M) and Balanced also for their split bands). Other sizes run the same networks on the GPU.
 - **Audio in a sample-buffer player.** If your player renders audio with
   `AVSampleBufferAudioRenderer`, observe
   `AVSampleBufferAudioRendererOutputConfigurationDidChangeNotification` and flush/re-feed from the
@@ -151,7 +187,8 @@ let s = upscaler.status   // state, preset, backend ("Neural Engine"/"GPU"), med
 - `MPVHookShader` parses Anime4K's mpv GLSL shaders and translates each pass to a Metal compute
   kernel (half precision for the networks). `.enhance` runs these on the GPU.
 - `Scripts/anime4k_to_coreml.py` reads the same GLSL files and rebuilds the networks as Core ML
-  programs (`Anime4K_A_S.mlmodelc`, `Anime4K_A_M.mlmodelc`, `Anime4K_C_S.mlmodelc`): 3×3 convolutions with replicate padding
+  programs (`Anime4K_A_S.mlmodelc`, `Anime4K_A_M.mlmodelc`, `Anime4K_A_MS.mlmodelc` (Balanced),
+  `Anime4K_C_S.mlmodelc`): 3×3 convolutions with replicate padding
   (the GPU samples clamp-to-edge), the CReLU folded as `(W1+W2)·max(t,0) − W2·t` (a quarter faster on
   the Neural Engine), Restore's residual add, and the de-ring statistics as a 5×5 max pool. Output:
   restored RGB, the four sub-pixel residuals and the statistics, as eight planes.
@@ -159,7 +196,7 @@ let s = upscaler.status   // state, preset, backend ("Neural Engine"/"GPU"), med
   → one fused GPU kernel doing depth-to-space, Anime4K's de-ring clamp and the conversion back to
   8-bit 4:2:0. Input and output tensors are IOSurface-backed pixel buffers shared between Metal and
   Core ML, so nothing is copied.
-- **A (M)'s split** (`HighSplit.swift`): the GPU converts only the model's band to planar RGB, the
+- **A (M)'s and Balanced's split** (`HighSplit.swift`): the GPU converts only the model's band to planar RGB, the
   Core ML prediction runs on that band (a strided view of the frame's tensors) while the GPU runs the
   shaders on the rest with a 24-row overlap (the networks' 14-pixel reach plus the 5×5 statistics) and
   then the fused tail on its own rows. After both finish, the GPU's rows just below the split are
@@ -172,7 +209,7 @@ let s = upscaler.status   // state, preset, backend ("Neural Engine"/"GPU"), med
 ```bash
 python3.11 -m venv env && env/bin/pip install coremltools numpy
 env/bin/python Scripts/anime4k_to_coreml.py --out build --check
-for m in A_S A_M C_S; do xcrun coremlcompiler compile build/Anime4K_$m.mlpackage Sources/Anime4KUpscaler/Resources/Anime4K; done
+for m in A_S A_M A_MS C_S; do xcrun coremlcompiler compile build/Anime4K_$m.mlpackage Sources/Anime4KUpscaler/Resources/Anime4K; done
 ```
 
 `--check` compares each model with an exact float64 evaluation of the shaders. The script reproduces
@@ -186,8 +223,8 @@ swift test
 ```
 
 Shader parsing and compilation, the watchdog, the frame cap, repeated-frame reuse, and, on a Mac with
-a Neural Engine, picture equality between the Neural Engine and GPU paths and between A (M) split and
-whole.
+a Neural Engine, picture equality between the Neural Engine and GPU paths and between A (M) or
+Balanced split and whole.
 `ANIME4K_UPSCALER_BENCH=1 swift test --filter Anime4KUpscalerBenchmark` prints timings.
 
 ## Credits and license

@@ -80,6 +80,15 @@ struct Anime4KUpscalerTests {
                 == ["Anime4K A (M)", "Anime4K A (S)", "Anime4K Restore (S)"])
         #expect(Anime4KUpscaler.presets(for: .upscaleEnhanceHigh).map(\.neuralEngineModel)
                 == ["Anime4K_A_M", "Anime4K_A_S", nil])
+        #expect(Anime4KUpscaler.presets(for: .upscaleEnhanceBalanced).map(\.name)
+                == ["Anime4K A (M/S)", "Anime4K A (S)", "Anime4K Restore (S)"])
+        #expect(Anime4KUpscaler.presets(for: .upscaleEnhanceBalanced).first?.splitRow == nil)
+        for (mode, row) in [(Anime4KMode.upscaleEnhanceBalanced720, 720), (.upscaleEnhanceBalanced780, 780),
+                            (.upscaleEnhanceBalanced840, 840)] {
+            let presets = Anime4KUpscaler.presets(for: mode)
+            #expect(presets.map(\.neuralEngineModel) == ["Anime4K_A_MS", "Anime4K_A_S", nil])
+            #expect(presets.first?.splitRow == row && Anime4KUpscaler.balancedSplitRows.contains(row))
+        }
     }
 
     /// Waits for the shaders and, when the mode wants it, the Neural Engine model.
@@ -94,7 +103,8 @@ struct Anime4KUpscalerTests {
 
     @Test("The Neural Engine draws the same picture as the GPU",
           arguments: [(Anime4KMode.upscaleEnhance, 1280, 720), (.upscaleEnhance, 1920, 1080),
-                      (.upscale, 1920, 1080), (.upscaleEnhanceHigh, 1280, 720)])
+                      (.upscale, 1920, 1080), (.upscaleEnhanceHigh, 1280, 720),
+                      (.upscaleEnhanceBalanced, 1920, 1080)])
     func neuralEngineMatchesGPU(mode: Anime4KMode, width: Int, height: Int) async throws {
         guard MTLCreateSystemDefaultDevice() != nil, NeuralEngineUpscaler.deviceHasNeuralEngine else { return }
         let size = (width, height)
@@ -428,20 +438,24 @@ struct Anime4KUpscalerTests {
     }
 }
 
-/// `.upscaleEnhanceHigh`'s Neural Engine / GPU split, and repeated-frame reuse.
-@Suite("A (M) split and repeated frames")
+/// `.upscaleEnhanceHigh`'s and Balanced's Neural Engine / GPU split, and repeated-frame reuse.
+@Suite("A (M) and Balanced split, and repeated frames")
 struct HighSplitAndRepeatTests {
-    @Test("A 1080p frame split between the Neural Engine and the GPU matches the whole frame")
-    func splitMatchesWholeFrame() async throws {
+    @Test("A 1080p frame split between the Neural Engine and the GPU matches the whole frame",
+          arguments: [Anime4KMode.upscaleEnhanceHigh, .upscaleEnhanceBalanced720, .upscaleEnhanceBalanced780,
+                      .upscaleEnhanceBalanced840])
+    func splitMatchesWholeFrame(mode: Anime4KMode) async throws {
         guard MTLCreateSystemDefaultDevice() != nil, NeuralEngineUpscaler.deviceHasNeuralEngine else { return }
         let upscaler = Anime4KUpscaler()
-        upscaler.setMode(.upscaleEnhanceHigh)
+        upscaler.setMode(mode)
+        let expectedRow = Anime4KUpscaler.presets(for: mode).first?.splitRow ?? 720
         // The same frame each time: repeated-frame reuse would skip every upscale after the first.
         upscaler.reusesRepeatedFrames = false
         try await Anime4KUpscalerTests.ready(upscaler)
         let source = try Anime4KUpscalerTests.busyFrame(width: 1920, height: 1080)
         func run(_ split: Bool, _ n: Int) throws -> CVPixelBuffer {
             upscaler.splitsHigh = split
+            upscaler.splitsBalanced = split
             var out: CVPixelBuffer?
             for _ in 0..<n { out = upscaler.process(source) }
             return try #require(out)
@@ -450,7 +464,7 @@ struct HighSplitAndRepeatTests {
         // after a whole frame, or after a move, the model's tensor already holds rows the split no
         // longer prepares, which hid a tail drawing them as a black band.
         let splitFrame = try run(true, 8)
-        #expect(upscaler.status.neuralEngineNote?.hasPrefix("split at row") == true)
+        #expect(upscaler.status.neuralEngineNote?.hasPrefix("split at row \(expectedRow):") == true)
         let splitLuma = Anime4KUpscalerTests.bytes(splitFrame, plane: 0)
         let splitChroma = Anime4KUpscalerTests.bytes(splitFrame, plane: 1)
         let whole = try run(false, 2)
@@ -463,12 +477,26 @@ struct HighSplitAndRepeatTests {
                 worst = max(worst, d)
             }
             let mean = Double(sum) / Double(a.count)
-            print(String(format: "[HighSplitAndRepeatTests] split vs whole %@: max %d codes, mean %.3f", name, worst, mean))
+            print(String(format: "[HighSplitAndRepeatTests] %@ split vs whole %@: max %d codes, mean %.3f",
+                         mode.rawValue, name, worst, mean))
             // The GPU's shaders and the model differ by rounding (~0.02-0.04 mean); a seam, a misplaced
             // band or rows left undrawn would differ by far more.
             #expect(worst <= 4, "\(name) max \(worst)")
             #expect(mean < 0.1, "\(name) mean \(mean)")
         }
+    }
+
+    @Test("Plain Balanced never splits")
+    func plainBalancedNeverSplits() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil, NeuralEngineUpscaler.deviceHasNeuralEngine else { return }
+        let upscaler = Anime4KUpscaler()
+        upscaler.setMode(.upscaleEnhanceBalanced)
+        upscaler.reusesRepeatedFrames = false
+        try await Anime4KUpscalerTests.ready(upscaler)
+        let source = try Anime4KUpscalerTests.busyFrame(width: 1920, height: 1080)
+        _ = try #require(upscaler.process(source))
+        #expect(upscaler.status.backend == "Neural Engine")
+        #expect(upscaler.status.neuralEngineNote?.hasPrefix("split at row") != true)
     }
 
     @Test("A repeated frame comes back as the last upscaled buffer; a changed one is upscaled again")

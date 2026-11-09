@@ -25,7 +25,7 @@ Usage (needs coremltools 9 and numpy, which have no wheels for Python 3.14; use 
     python3.11 -m venv env && env/bin/pip install coremltools numpy
     env/bin/python Scripts/anime4k_to_coreml.py --out <dir> [--check]
 then compile what it writes:
-    for m in A_S A_M C_S; do xcrun coremlcompiler compile <dir>/Anime4K_$m.mlpackage \
+    for m in A_S A_M A_MS C_S; do xcrun coremlcompiler compile <dir>/Anime4K_$m.mlpackage \
         Sources/Anime4KUpscaler/Resources/Anime4K; done
 """
 
@@ -53,11 +53,17 @@ SPLIT_HALO = 24
 # ~26 s on an Apple TV 4K, 3rd gen), so only the rows that box settles around (600) are built.
 SPLIT_ROWS = [540, 600, 660, 720]
 SPLIT_SIZES = {"A_M": [(1920, c + SPLIT_HALO) for c in SPLIT_ROWS]}
+# Balanced (A_MS) splits at fixed rows, one per mode (`.upscaleEnhanceBalanced720/780/840`). Must match
+# `Anime4KUpscaler.balancedSplitRows`. Its reach (7 + 4 layers) is inside the same halo.
+BALANCED_SPLIT_ROWS = [720, 780, 840]
+SPLIT_SIZES["A_MS"] = [(1920, c + SPLIT_HALO) for c in BALANCED_SPLIT_ROWS]
 
 # Model name -> (restore network or None, upscale network). C has no restore: its MAIN is the input.
 NETWORKS = {
     "A_S": ("Anime4K_Restore_CNN_S.glsl", "Anime4K_Upscale_CNN_x2_S.glsl"),
     "A_M": ("Anime4K_Restore_CNN_M.glsl", "Anime4K_Upscale_CNN_x2_M.glsl"),
+    # Balanced: A (M)'s restore (the half that shows most) with A (S)'s upscale.
+    "A_MS": ("Anime4K_Restore_CNN_M.glsl", "Anime4K_Upscale_CNN_x2_S.glsl"),
     "C_S": (None, "Anime4K_Upscale_Denoise_CNN_x2_S.glsl"),
 }
 

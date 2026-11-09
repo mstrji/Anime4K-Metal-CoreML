@@ -23,6 +23,18 @@ public enum Anime4KMode: String, Sendable, Equatable, CaseIterable {
     /// Engine (top rows) and the GPU (bottom rows), which run at the same time; other sizes run whole on
     /// the Neural Engine. Steps back to `upscaleEnhance`, then `enhance`, then off.
     case upscaleEnhanceHigh
+    /// Balanced: A (M)'s larger restore network with A (S)'s 2× upscale (1080p → 4K). The restore half is
+    /// the one that shows most, so this spends the extra work there. Whole on the Neural Engine, **never
+    /// split** (~36 ms a frame on an Apple TV 4K, 3rd gen: inside a 24 fps budget, but with little room).
+    /// Steps back to `upscaleEnhance`, then `enhance`, then off.
+    case upscaleEnhanceBalanced
+    /// Balanced with a 1920×1080 frame split between the Neural Engine (the top 720, 780 or 840 rows) and
+    /// the GPU (the rest), at that fixed row, while `splitsBalanced` is on (other sizes run whole). On an
+    /// Apple TV 4K (3rd gen): 720 is fastest (~28 ms a frame), 840 leaves the GPU the least work (~31 ms).
+    /// Steps back like `upscaleEnhanceBalanced`.
+    case upscaleEnhanceBalanced720
+    case upscaleEnhanceBalanced780
+    case upscaleEnhanceBalanced840
 }
 
 /// What the upscaler is doing right now, for diagnostics. Read `Anime4KUpscaler.status`; it is a
@@ -98,12 +110,27 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         var scale: Int = 2
         /// The Core ML model that runs its networks on the Neural Engine (`NeuralEngineUpscaler`), if any.
         var neuralEngineModel: String?
+        /// Balanced's split modes: the fixed row a 1920×1080 frame splits at (`HighSplit.swift`).
+        var splitRow: Int?
+
+        /// What its compiled GPU chain is looked up by: the shader files, so presets running the same
+        /// networks (Balanced and its split modes) share one chain.
+        var chainKey: String { files.joined(separator: "+") }
     }
 
     /// Mode A with Anime4K's (M) networks: the same chain as A (S), larger restore and upscale networks.
     static let mediumPreset = Preset(name: "Anime4K A (M)", files: [
         "Anime4K_Clamp_Highlights", "Anime4K_Restore_CNN_M", "Anime4K_Upscale_CNN_x2_M"],
         neuralEngineModel: "Anime4K_A_M")
+    /// Balanced: A (M)'s restore network with A (S)'s upscale network.
+    static let balancedPreset = Preset(name: "Anime4K A (M/S)", files: [
+        "Anime4K_Clamp_Highlights", "Anime4K_Restore_CNN_M", "Anime4K_Upscale_CNN_x2_S"],
+        neuralEngineModel: "Anime4K_A_MS")
+    /// Balanced split at a fixed row (`.upscaleEnhanceBalanced720/780/840`).
+    static func balancedSplitPreset(row: Int) -> Preset {
+        Preset(name: "Anime4K A (M/S) \(row)", files: balancedPreset.files, neuralEngineModel: "Anime4K_A_MS",
+               splitRow: row)
+    }
     /// Anime4K's "Mode A" chain for 1080p → 4K: de-ring statistics, CNN restore, CNN 2× upscale and
     /// the de-ring clamp.
     static let smallPreset = Preset(name: "Anime4K A (S)", files: [
@@ -127,11 +154,15 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         case .upscale: return [lightPreset]
         case .upscaleEnhance: return [smallPreset, restoreOnlyPreset]
         case .upscaleEnhanceHigh: return [mediumPreset, smallPreset, restoreOnlyPreset]
+        case .upscaleEnhanceBalanced: return [balancedPreset, smallPreset, restoreOnlyPreset]
+        case .upscaleEnhanceBalanced720: return [balancedSplitPreset(row: 720), smallPreset, restoreOnlyPreset]
+        case .upscaleEnhanceBalanced780: return [balancedSplitPreset(row: 780), smallPreset, restoreOnlyPreset]
+        case .upscaleEnhanceBalanced840: return [balancedSplitPreset(row: 840), smallPreset, restoreOnlyPreset]
         }
     }
 
     /// Every preset bundled, for the benchmark.
-    static let allPresets: [Preset] = [mediumPreset, smallPreset, lightPreset, restoreOnlyPreset]
+    static let allPresets: [Preset] = [mediumPreset, balancedPreset, smallPreset, lightPreset, restoreOnlyPreset]
 
     /// Largest source it upscales: 2× of it is the 4K canvas (1088 covers coded-height H.264).
     public static let maximumSourceSize = (width: 1920, height: 1088)
@@ -207,6 +238,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
     var highSplitWindow: [(Double, Double, Double)] = []
     var highSplitArrivedAt = Date.distantPast
     var splitsHighStorage = true
+    var splitsBalancedStorage = true
     var rebalancesHighSplitStorage = false
     /// Repeated-frame reuse (`RepeatFrames.swift`), guarded by `workLock`.
     var repeatState: RepeatState?
@@ -223,6 +255,14 @@ public final class Anime4KUpscaler: @unchecked Sendable {
     public var splitsHigh: Bool {
         get { stateLock.lock(); defer { stateLock.unlock() }; return splitsHighStorage }
         set { stateLock.lock(); splitsHighStorage = newValue; stateLock.unlock() }
+    }
+
+    /// Whether `.upscaleEnhanceBalanced720/780/840` split a 1920×1080 frame between the Neural Engine and
+    /// the GPU at their row (on by default). Off, they run whole like `.upscaleEnhanceBalanced`, which
+    /// never splits.
+    public var splitsBalanced: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return splitsBalancedStorage }
+        set { stateLock.lock(); splitsBalancedStorage = newValue; stateLock.unlock() }
     }
 
     /// Whether `.upscaleEnhanceHigh`'s split moves from row 720 (off by default). On an Apple TV 4K
@@ -327,7 +367,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         status.backend = lastBackend
         if let model = modePresets[presetIndex].neuralEngineModel {
             status.neuralEngineNote = neuralEngineNotes[model]
-                ?? (modePresets[presetIndex] == Self.mediumPreset ? highSplitNote : nil)
+                ?? (Self.canSplit(modePresets[presetIndex]) ? highSplitNote : nil)
         }
         status.budgetMilliseconds = budget
         status.averageFrameMilliseconds = timing.medianWall
@@ -524,7 +564,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
             texturesToPlanes: try? pipeline("upscaler_textures_to_planes"),
             fusedTailRows: try? pipeline("upscaler_fused_tail_rows"),
             repeatCompare: try? pipeline("upscaler_repeat_compare"),
-            presets: Dictionary(uniqueKeysWithValues: zip(runnable.map(\.name), pipelines)), sampler: sampler)
+            presets: Dictionary(uniqueKeysWithValues: zip(runnable.map(\.chainKey), pipelines)), sampler: sampler)
     }
 
     // MARK: - Per frame
@@ -640,7 +680,7 @@ public final class Anime4KUpscaler: @unchecked Sendable {
         stateLock.lock()
         let modePresets = Self.presets(for: mode)
         guard mode != .off, failure == nil, let resources, presetIndex < modePresets.count,
-              let pipeline = resources.presets[modePresets[presetIndex].name] else {
+              let pipeline = resources.presets[modePresets[presetIndex].chainKey] else {
             stateLock.unlock()
             return nil
         }

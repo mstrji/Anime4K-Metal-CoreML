@@ -25,18 +25,24 @@ extension Anime4KUpscaler {
     /// on first load.
     static let highSplitRows = [540, 600, 660, 720]
     static let highSplitHalo = 24
+    /// Balanced's split rows, one per mode, each a band size its model was built for
+    /// (`Scripts/anime4k_to_coreml.py`, BALANCED_SPLIT_ROWS). Fixed: never rebalanced.
+    static let balancedSplitRows = [720, 780, 840]
 
-    /// Where to split this frame, or nil to run it whole: A (M) only, 1920x1080 only, with the fused
+    /// A (M), or one of Balanced's split modes.
+    static func canSplit(_ preset: Preset) -> Bool { preset == mediumPreset || preset.splitRow != nil }
+
+    /// Where to split this frame, or nil to run it whole: A (M) or a Balanced split mode, 1920x1080 only, with the fused
     /// tail's shaders and every kernel the split needs.
     func highSplitRow(preset: Preset, width: Int, height: Int, model: NeuralEngineUpscaler,
                          pipeline: MPVHookPipeline, resources: Resources) -> Int? {
-        guard preset == Self.mediumPreset, width == 1920, height == 1080, fusesTail, pipeline.hasFusableTail,
+        guard Self.canSplit(preset), width == 1920, height == 1080, fusesTail, pipeline.hasFusableTail,
               resources.texturesToPlanes != nil, resources.yuvToRGBRows != nil, resources.fusedTail != nil,
               resources.fusedTailRows != nil
         else { return nil }
         stateLock.lock()
-        let enabled = splitsHighStorage
-        let row = Self.highSplitRows[highSplitIndex]
+        let enabled = preset.splitRow == nil ? splitsHighStorage : splitsBalancedStorage
+        let row = preset.splitRow ?? Self.highSplitRows[highSplitIndex]
         stateLock.unlock()
         guard enabled, model.supports(width: width, height: row + Self.highSplitHalo) else { return nil }
         return row
@@ -214,9 +220,11 @@ extension Anime4KUpscaler {
         // were tried on an Apple TV 4K (3rd gen) and each either hopped between rows (gaps of 8-10% are
         // the halves' ordinary noise) or stayed put on a worse row because the gap never crossed 15%.
         let total = (CFAbsoluteTimeGetCurrent() - workStarted) * 1000
-        if rebalancesHighSplitStorage { highSplitWindow.append((prediction, gpuBandMilliseconds, total)) }
+        // Balanced's rows are fixed; its model carries other band sizes than A (M)'s.
+        let rebalances = rebalancesHighSplitStorage && model.modelName == "Anime4K_A_M"
+        if rebalances { highSplitWindow.append((prediction, gpuBandMilliseconds, total)) }
         var moved: String?
-        if rebalancesHighSplitStorage, highSplitWindow.count >= 48 {
+        if rebalances, highSplitWindow.count >= 48 {
             func median(_ v: [Double]) -> Double { v.sorted()[v.count / 2] }
             let ne = median(highSplitWindow.map(\.0)), gpu = median(highSplitWindow.map(\.1))
             highSplitWindow.removeAll()
@@ -243,9 +251,10 @@ extension Anime4KUpscaler {
         let line = highSplitNote ?? ""
         stateLock.unlock()
         // Every 2 s, so a device log shows where the split settled and what each side took.
-        if log { Anime4KLog.emit(String(format: "[Upscaler] A (M) %@, frame %.0f ms", line, total)) }
+        let presetName = model.modelName == "Anime4K_A_MS" ? "A (M/S)" : "A (M)"
+        if log { Anime4KLog.emit(String(format: "[Upscaler] %@ %@, frame %.0f ms", presetName, line, total)) }
         if let moved {
-            Anime4KLog.emit("[Upscaler] A (M) split moves \(moved) to row \(newRow)")
+            Anime4KLog.emit("[Upscaler] \(presetName) split moves \(moved) to row \(newRow)")
         }
 
         let gpu = (max(0, before.gpuEndTime - before.gpuStartTime) + max(0, gpuBand.gpuEndTime - gpuBand.gpuStartTime)
